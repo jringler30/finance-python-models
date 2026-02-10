@@ -23,18 +23,20 @@ st.set_page_config(
     page_icon="📊",
     layout="wide",
 )
-#------------------------
-#gdown
+# ------------------------
+# Google Drive CSV loader
+# ------------------------
+
 import gdown
 from pathlib import Path
 import streamlit as st
 
-DATA_PATH = Path(__file__).parent / "price_data.csv"
+DATA_PATH = Path(__file__).resolve().parent / "price_data.csv"
 
-FILE_ID = "PASTE_FILE_ID_HERE"
-GDRIVE_URL = f"https://drive.google.com/uc?id=1l7aJ9vrCBXgheI4g0cjMCduHW9XAhpeU"
+FILE_ID = "1l7aJ9vrCBXgheI4g0cjMCduHW9XAhpeU"
+GDRIVE_URL = f"https://drive.google.com/uc?id={FILE_ID}"
 
-@st.cache_resource
+@st.cache_data
 def ensure_data():
     if not DATA_PATH.exists():
         gdown.download(GDRIVE_URL, str(DATA_PATH), quiet=False)
@@ -42,8 +44,8 @@ def ensure_data():
 ensure_data()
 
 st.write("price_data.csv exists:", DATA_PATH.exists())
+#_______________
 
-#------------------------
 from pathlib import Path
 import streamlit as st
 
