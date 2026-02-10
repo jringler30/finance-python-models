@@ -24,6 +24,16 @@ st.set_page_config(
     layout="wide",
 )
 
+from pathlib import Path
+import streamlit as st
+
+p = Path(__file__).resolve().parent / "price_data.csv"
+st.write("price_data.csv exists:", p.exists())
+if p.exists():
+    first_line = p.open("r", encoding="utf-8", errors="ignore").readline().strip()
+    st.write("First line of price_data.csv:", first_line[:120])
+
+
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  CORE ENGINE FUNCTIONS (unchanged logic from original)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
