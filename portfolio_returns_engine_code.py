@@ -24,7 +24,24 @@ st.set_page_config(
     layout="wide",
 )
 #------------------------
-#Data
+#gdown
+import gdown
+from pathlib import Path
+import streamlit as st
+
+DATA_PATH = Path(__file__).parent / "price_data.csv"
+
+FILE_ID = "PASTE_FILE_ID_HERE"
+GDRIVE_URL = f"https://drive.google.com/uc?id={1l7aJ9vrCBXgheI4g0cjMCduHW9XAhpeU}"
+
+@st.cache_resource
+def ensure_data():
+    if not DATA_PATH.exists():
+        gdown.download(GDRIVE_URL, str(DATA_PATH), quiet=False)
+
+ensure_data()
+
+st.write("price_data.csv exists:", DATA_PATH.exists())
 
 #------------------------
 from pathlib import Path
@@ -254,7 +271,7 @@ def load_data():
         )
         st.stop()
 
-    return pd.read_csv(csv_path)
+    return pd.read_csv(DATA_PATH)
 
 
 df = load_data()
