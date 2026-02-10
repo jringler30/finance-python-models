@@ -227,7 +227,21 @@ def build_daily_series(df, holdings, initial_capital, price_field="PRICECLOSE"):
 @st.cache_data
 def load_data():
     """Load price dataset from CSV in the repo."""
-    return pd.read_csv("price_data.csv")
+    import os
+    # Resolve path relative to this script's location (works on Streamlit Cloud)
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    csv_path = os.path.join(script_dir, "price_data.csv")
+
+    if not os.path.exists(csv_path):
+        st.error(
+            f"**File not found:** `price_data.csv`\n\n"
+            f"Looked in: `{script_dir}`\n\n"
+            f"Make sure `price_data.csv` is committed to your GitHub repo "
+            f"in the same folder as this script."
+        )
+        st.stop()
+
+    return pd.read_csv(csv_path)
 
 
 df = load_data()
@@ -261,9 +275,11 @@ for i in range(int(num_holdings)):
     cols = st.sidebar.columns([2, 1])
     default_tk = defaults[i][0] if i < len(defaults) else ""
     default_wt = defaults[i][1] if i < len(defaults) else 0.0
+    # Safe index: fall back to first available ticker if default isn't in dataset
+    default_idx = available_tickers.index(default_tk) if default_tk in available_tickers else 0
     tk = cols[0].selectbox(
         f"Ticker {i+1}", options=available_tickers,
-        index=available_tickers.index(default_tk) if default_tk in available_tickers else 0,
+        index=default_idx,
         key=f"tk_{i}",
     )
     wt = cols[1].number_input(
@@ -278,16 +294,16 @@ st.sidebar.markdown("### Parameters")
 
 # -- Date range --
 date_cols = st.sidebar.columns(2)
-min_date = df["PRICEDATE"].min() if "PRICEDATE" in df.columns else date(2023, 1, 1)
-max_date = df["PRICEDATE"].max() if "PRICEDATE" in df.columns else date(2024, 12, 31)
-# Ensure they're date objects
-if isinstance(min_date, pd.Timestamp):
-    min_date = min_date.date()
-if isinstance(max_date, pd.Timestamp):
-    max_date = max_date.date()
+df_dates = pd.to_datetime(df["PRICEDATE"], errors="coerce").dropna()
+min_date = df_dates.min().date()
+max_date = df_dates.max().date()
 
-start_date = date_cols[0].date_input("Start Date", value=date(2023, 6, 1), min_value=min_date, max_value=max_date)
-end_date = date_cols[1].date_input("End Date", value=date(2024, 6, 1), min_value=min_date, max_value=max_date)
+# Safe defaults: 1 year before max_date → max_date (clamped to actual range)
+default_end = max_date
+default_start = max(min_date, (max_date - timedelta(days=365)))
+
+start_date = date_cols[0].date_input("Start Date", value=default_start, min_value=min_date, max_value=max_date)
+end_date = date_cols[1].date_input("End Date", value=default_end, min_value=min_date, max_value=max_date)
 
 # -- Capital & options --
 initial_capital = st.sidebar.number_input(
@@ -443,4 +459,3 @@ with st.expander("ℹ️ Assumptions & Methodology"):
 **Fractional Shares**: Allowed by default. Toggle "Whole shares only" to use integer
 shares with cash residual.
     """)
-    
