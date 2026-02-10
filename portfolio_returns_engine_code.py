@@ -443,3 +443,4 @@ with st.expander("ℹ️ Assumptions & Methodology"):
 **Fractional Shares**: Allowed by default. Toggle "Whole shares only" to use integer
 shares with cash residual.
     """)
+    
