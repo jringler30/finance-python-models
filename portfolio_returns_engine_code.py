@@ -32,7 +32,7 @@ import streamlit as st
 DATA_PATH = Path(__file__).parent / "price_data.csv"
 
 FILE_ID = "PASTE_FILE_ID_HERE"
-GDRIVE_URL = f"https://drive.google.com/uc?id={1l7aJ9vrCBXgheI4g0cjMCduHW9XAhpeU}"
+GDRIVE_URL = f"https://drive.google.com/uc?id=1l7aJ9vrCBXgheI4g0cjMCduHW9XAhpeU"
 
 @st.cache_resource
 def ensure_data():
