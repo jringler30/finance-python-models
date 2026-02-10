@@ -467,19 +467,27 @@ except ImportError:
 
 # %% [markdown]
 """
-## Cell 5 — Portfolio Visualizations
+## Cell 5 — Portfolio Visualizations (Streamlit + Plotly)
 
-Two charts:
-1. **Portfolio Value vs Cost Basis** — daily portfolio market value with the flat cost-basis
-   line; the gap between them is shaded green (gain) or red (loss).
-2. **Per-Ticker Cumulative Return** — one line per holding so you can see which
-   tickers drove performance.
+Two interactive charts rendered via `plotly.graph_objects` and displayed with
+`st.plotly_chart()` when running in Streamlit, or `fig.show()` elsewhere.
+
+- **Chart 1**: Portfolio value vs cost basis with shaded gain/loss regions.
+- **Chart 2**: Per-ticker cumulative price return (%).
+
+Dependencies: `plotly` (bundled with Streamlit — no extra install needed).
 """
 
 # %%
-import matplotlib.pyplot as plt
-import matplotlib.dates as mdates
-import matplotlib.ticker as mticker
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+
+# Detect whether we're running inside Streamlit
+try:
+    import streamlit as _st_check
+    _STREAMLIT = True
+except ImportError:
+    _STREAMLIT = False
 
 
 def build_daily_portfolio_series(
@@ -532,7 +540,7 @@ def build_daily_portfolio_series(
     return daily
 
 
-def plot_portfolio_visualizations(
+def create_portfolio_figures(
     df: pd.DataFrame,
     holdings: pd.DataFrame,
     summary: dict,
@@ -540,104 +548,156 @@ def plot_portfolio_visualizations(
     price_field: str = "PRICECLOSE",
 ):
     """
-    Render two charts:
-      (1) Portfolio value vs cost basis with shaded unrealized gain/loss.
-      (2) Per-ticker cumulative return lines.
+    Build two Plotly figures:
+      fig1 — Portfolio value vs cost basis with shaded gain/loss.
+      fig2 — Per-ticker cumulative return lines.
+
+    Returns (fig1, fig2) so the caller can render them with
+    st.plotly_chart() or fig.show().
     """
     daily = build_daily_portfolio_series(df, holdings, initial_capital, price_field)
     tickers = holdings["ticker"].tolist()
-
-    fig, axes = plt.subplots(2, 1, figsize=(14, 10), sharex=True,
-                             gridspec_kw={"height_ratios": [3, 2]})
-
-    # ── Chart 1: Portfolio Value vs Cost Basis ──────────────
-    ax1 = axes[0]
     dates = daily.index
     pv = daily["portfolio_value"]
-    cb = daily["cost_basis"]
 
-    ax1.plot(dates, pv, color="#1a73e8", linewidth=1.8, label="Portfolio Value", zorder=3)
-    ax1.axhline(y=initial_capital, color="#555555", linewidth=1.2,
-                linestyle="--", label="Cost Basis", zorder=2)
+    # ── Figure 1: Portfolio Value vs Cost Basis ────────────
+    fig1 = go.Figure()
 
-    # Shade: green where value > cost, red where value < cost
-    ax1.fill_between(
-        dates, pv, cb,
-        where=(pv >= cb),
-        interpolate=True,
-        color="#34a853", alpha=0.25,
-        label="Unrealized Gain",
-        zorder=1,
+    # Shaded gain region (green): area from cost basis UP to portfolio value
+    # We use two stacked area traces to create the fill-between effect.
+    # Trace 1: cost basis as lower bound (invisible fill to zero, acts as base)
+    # Trace 2: portfolio value fills DOWN to trace 1
+
+    # -- Green fill where portfolio >= cost basis --
+    pv_gain = pv.copy()
+    pv_gain[pv_gain < initial_capital] = initial_capital  # clip to cost basis
+    fig1.add_trace(go.Scatter(
+        x=dates, y=[initial_capital] * len(dates),
+        mode="lines", line=dict(width=0),
+        showlegend=False, hoverinfo="skip",
+    ))
+    fig1.add_trace(go.Scatter(
+        x=dates, y=pv_gain,
+        mode="lines", line=dict(width=0),
+        fill="tonexty", fillcolor="rgba(52, 168, 83, 0.20)",
+        name="Unrealized Gain", hoverinfo="skip",
+    ))
+
+    # -- Red fill where portfolio < cost basis --
+    pv_loss = pv.copy()
+    pv_loss[pv_loss > initial_capital] = initial_capital  # clip to cost basis
+    fig1.add_trace(go.Scatter(
+        x=dates, y=[initial_capital] * len(dates),
+        mode="lines", line=dict(width=0),
+        showlegend=False, hoverinfo="skip",
+    ))
+    fig1.add_trace(go.Scatter(
+        x=dates, y=pv_loss,
+        mode="lines", line=dict(width=0),
+        fill="tonexty", fillcolor="rgba(234, 67, 53, 0.20)",
+        name="Unrealized Loss", hoverinfo="skip",
+    ))
+
+    # Portfolio value line (on top)
+    fig1.add_trace(go.Scatter(
+        x=dates, y=pv,
+        mode="lines",
+        line=dict(color="#1a73e8", width=2.5),
+        name="Portfolio Value",
+        hovertemplate="<b>%{x|%b %d, %Y}</b><br>Value: $%{y:,.0f}<extra></extra>",
+    ))
+
+    # Cost basis dashed line
+    fig1.add_trace(go.Scatter(
+        x=dates, y=[initial_capital] * len(dates),
+        mode="lines",
+        line=dict(color="#555555", width=1.5, dash="dash"),
+        name=f"Cost Basis (${initial_capital:,.0f})",
+        hoverinfo="skip",
+    ))
+
+    # Final annotation
+    final_val = float(pv.iloc[-1])
+    gain_pct = (final_val / initial_capital) - 1
+    gain_color = "#34a853" if gain_pct >= 0 else "#ea4335"
+    fig1.add_annotation(
+        x=dates[-1], y=final_val,
+        text=f"<b>${final_val:,.0f}</b><br>({gain_pct:+.2%})",
+        showarrow=True, arrowhead=2, arrowcolor=gain_color,
+        font=dict(color=gain_color, size=12),
+        ax=40, ay=-30,
     )
-    ax1.fill_between(
-        dates, pv, cb,
-        where=(pv < cb),
-        interpolate=True,
-        color="#ea4335", alpha=0.25,
-        label="Unrealized Loss",
-        zorder=1,
+
+    fig1.update_layout(
+        title=dict(text="Portfolio Value vs Cost Basis — Unrealized Capital Gains",
+                   font=dict(size=16)),
+        yaxis=dict(title="Value ($)", tickformat="$,.0f", gridcolor="rgba(0,0,0,0.08)"),
+        xaxis=dict(gridcolor="rgba(0,0,0,0.08)"),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+        template="plotly_white",
+        height=450,
+        margin=dict(l=60, r=40, t=80, b=40),
     )
 
-    # Annotate final values
-    final_val = pv.iloc[-1]
-    gain_dollar = final_val - initial_capital
-    gain_pct = gain_dollar / initial_capital
-    gain_color = "#34a853" if gain_dollar >= 0 else "#ea4335"
-    ax1.annotate(
-        f"${final_val:,.0f}\n({gain_pct:+.2%})",
-        xy=(dates[-1], final_val),
-        xytext=(15, 10), textcoords="offset points",
-        fontsize=10, fontweight="bold", color=gain_color,
-        arrowprops=dict(arrowstyle="->", color=gain_color, lw=1.2),
-    )
-    ax1.annotate(
-        f"Cost: ${initial_capital:,.0f}",
-        xy=(dates[-1], initial_capital),
-        xytext=(15, -18), textcoords="offset points",
-        fontsize=9, color="#555555",
-    )
-
-    ax1.set_title("Portfolio Value vs Cost Basis — Unrealized Capital Gains",
-                   fontsize=14, fontweight="bold", pad=12)
-    ax1.set_ylabel("Value ($)", fontsize=11)
-    ax1.yaxis.set_major_formatter(mticker.FuncFormatter(lambda x, _: f"${x:,.0f}"))
-    ax1.legend(loc="upper left", fontsize=9, framealpha=0.9)
-    ax1.grid(axis="y", alpha=0.3)
-    ax1.set_xlim(dates[0], dates[-1])
-
-    # ── Chart 2: Per-Ticker Cumulative Returns ─────────────
-    ax2 = axes[1]
-    colors = plt.cm.Set2.colors  # nice qualitative palette
+    # ── Figure 2: Per-Ticker Cumulative Returns ────────────
+    fig2 = go.Figure()
+    colors = ["#1a73e8", "#ea4335", "#34a853", "#fbbc04", "#9334e6",
+              "#ff6d01", "#46bdc6", "#7baaf7"]
 
     for i, tk in enumerate(tickers):
         tk_vals = daily[tk]
-        start_val = tk_vals.iloc[0]
-        cum_return = (tk_vals / start_val - 1) * 100  # in percent
-        ax2.plot(dates, cum_return, linewidth=1.5,
-                 color=colors[i % len(colors)], label=tk)
+        start_val = float(tk_vals.iloc[0])
+        cum_ret = (tk_vals / start_val - 1) * 100
+        fig2.add_trace(go.Scatter(
+            x=dates, y=cum_ret,
+            mode="lines",
+            line=dict(color=colors[i % len(colors)], width=2),
+            name=tk,
+            hovertemplate=f"<b>{tk}</b><br>" + "%{x|%b %d, %Y}<br>Return: %{y:+.1f}%<extra></extra>",
+        ))
 
-    ax2.axhline(y=0, color="#555555", linewidth=0.8, linestyle="--")
-    ax2.set_title("Per-Ticker Cumulative Price Return (%)", fontsize=13,
-                   fontweight="bold", pad=10)
-    ax2.set_ylabel("Return (%)", fontsize=11)
-    ax2.set_xlabel("Date", fontsize=11)
-    ax2.yaxis.set_major_formatter(mticker.FuncFormatter(lambda x, _: f"{x:+.1f}%"))
-    ax2.legend(loc="upper left", fontsize=9, framealpha=0.9, ncol=len(tickers))
-    ax2.grid(axis="y", alpha=0.3)
+    fig2.add_hline(y=0, line_dash="dash", line_color="#555555", line_width=0.8)
 
-    # Shared x-axis formatting
-    ax2.xaxis.set_major_locator(mdates.MonthLocator(interval=2))
-    ax2.xaxis.set_major_formatter(mdates.DateFormatter("%b '%y"))
-    plt.setp(ax2.xaxis.get_majorticklabels(), rotation=40, ha="right")
+    fig2.update_layout(
+        title=dict(text="Per-Ticker Cumulative Price Return (%)",
+                   font=dict(size=16)),
+        yaxis=dict(title="Return (%)", ticksuffix="%", gridcolor="rgba(0,0,0,0.08)"),
+        xaxis=dict(gridcolor="rgba(0,0,0,0.08)"),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+        template="plotly_white",
+        height=380,
+        margin=dict(l=60, r=40, t=80, b=40),
+    )
 
-    fig.tight_layout()
-    plt.savefig("portfolio_visualization.png", dpi=150, bbox_inches="tight")
-    plt.show()
-    print("📈 Charts saved to portfolio_visualization.png")
+    return fig1, fig2
+
+
+def display_portfolio_charts(
+    df: pd.DataFrame,
+    holdings: pd.DataFrame,
+    summary: dict,
+    initial_capital: float,
+    price_field: str = "PRICECLOSE",
+):
+    """
+    Render charts. Auto-detects Streamlit vs plain Python environment.
+    """
+    fig1, fig2 = create_portfolio_figures(
+        df, holdings, summary, initial_capital, price_field
+    )
+
+    if _STREAMLIT:
+        import streamlit as st
+        st.plotly_chart(fig1, use_container_width=True)
+        st.plotly_chart(fig2, use_container_width=True)
+    else:
+        # Colab / Jupyter / plain Python
+        fig1.show()
+        fig2.show()
 
 
 # Run the visualization
-plot_portfolio_visualizations(
+display_portfolio_charts(
     df=df,
     holdings=holdings,
     summary=summary,
