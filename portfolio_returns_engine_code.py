@@ -23,7 +23,23 @@ st.set_page_config(
     page_icon="📊",
     layout="wide",
 )
+#------------------------
+#Data
+import streamlit as st
+import gdown
+import os
 
+@st.cache_data
+def ensure_data():
+    if not os.path.exists("price_data.csv"):
+        gdown.download(
+            "https://drive.google.com/uc?id=1l7aJ9vrCBXgheI4g0cjMCduHW9XAhpeU",
+            quiet=False
+        )
+
+ensure_data()
+
+#------------------------
 from pathlib import Path
 import streamlit as st
 
