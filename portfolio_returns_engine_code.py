@@ -37,8 +37,9 @@ import gdown
 from pathlib import Path
 import streamlit as st
 import tempfile
+from pathlib import Path
 
-DATA_PATH = Path(tempfile.gettempdir()) / "price_data.parquet"
+DATA_PATH = Path("/tmp/price_data.parquet")
 
 FILE_ID = "1pMQ817V05j4RK0vqJcVkBMmOBK5zRrug"
 GDRIVE_URL = f"https://drive.google.com/uc?id={FILE_ID}"
