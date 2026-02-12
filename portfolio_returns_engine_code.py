@@ -84,7 +84,6 @@ def validate_weights(tickers: List[str], weights: List[float],
     return tickers_out, weights_out
 
 
-@st.cache_data
 def prepare_price_data(df: pd.DataFrame, price_field: str = "PRICECLOSE") -> pd.DataFrame:
     df = df.copy()
     df["PRICEDATE"] = pd.to_datetime(df["PRICEDATE"], errors="coerce")
@@ -144,7 +143,7 @@ def calculate_portfolio_returns(
     if start_dt >= end_dt:
         raise ValueError("start_date must be before end_date.")
 
-    clean = prepare_price_data(df, price_field)
+    clean = df
     available = set(clean["TICKERSYMBOL"].unique())
     missing = [t for t in tickers if t not in available]
     if missing:
@@ -218,6 +217,9 @@ def build_daily_series(df, holdings, initial_capital, price_field="PRICECLOSE"):
     all_start = pd.to_datetime(holdings["Start Date"]).min()
     all_end = pd.to_datetime(holdings["End Date"]).max()
     clean = clean[(clean["PRICEDATE"] >= all_start) & (clean["PRICEDATE"] <= all_end)]
+    
+    clean = clean[clean["TICKERSYMBOL"].isin(tickers)]
+
 
     frames = []
     for _, row in holdings.iterrows():
@@ -281,6 +283,9 @@ def build_daily_rebalanced_series(df, holdings, initial_capital, price_field="PR
     all_start = pd.to_datetime(holdings["Start Date"]).min()
     all_end = pd.to_datetime(holdings["End Date"]).max()
     clean = clean[(clean["PRICEDATE"] >= all_start) & (clean["PRICEDATE"] <= all_end)]
+
+    clean = clean[clean["TICKERSYMBOL"].isin(tickers)]
+
 
     price_frames = []
     for tk in tickers:
@@ -395,17 +400,33 @@ def build_daily_rebalanced_series(df, holdings, initial_capital, price_field="PR
 #  LOAD DATA
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
+_REQUIRED_COLS = ["TICKERSYMBOL", "PRICEDATE", "PRICECLOSE", "PRICEMID", "TRADINGITEMSTATUSID"]
+
 @st.cache_data(show_spinner=True)
 def load_data():
-    # ensure_data() already downloads the file if missing
+    ensure_data()
+
+    # Guardrail: file exists + not tiny
     if not DATA_PATH.exists():
-        st.error(f"Dataset not found after download attempt: {DATA_PATH}")
+        st.error(f"Dataset not found: {DATA_PATH}")
         st.stop()
-    return pd.read_parquet(DATA_PATH)
+    if DATA_PATH.stat().st_size < 10 * 1024 * 1024:  # 10MB
+        st.error("Downloaded file looks too small (likely corrupt). Reboot app to retry.")
+        st.stop()
+
+    # Read only needed columns
+    try:
+        df = pd.read_parquet(DATA_PATH, columns=_REQUIRED_COLS)
+    except Exception as e:
+        st.error(f"Failed to read parquet: {e}")
+        st.stop()
+
+    # Clean once
+    df = prepare_price_data(df, price_field="PRICECLOSE")  # this also normalizes dates/tickers
+    return df
 
 df = load_data()
 available_tickers = sorted(df["TICKERSYMBOL"].astype(str).str.strip().str.upper().unique())
-
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  SIDEBAR — USER INPUTS
