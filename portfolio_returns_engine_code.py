@@ -283,6 +283,7 @@ def build_daily_rebalanced_series(df, holdings, initial_capital, price_field="PR
     all_end = pd.to_datetime(holdings["End Date"]).max()
     clean = clean[(clean["PRICEDATE"] >= all_start) & (clean["PRICEDATE"] <= all_end)]
 
+    tickers = holdings["Ticker"].astype(str).str.strip().str.upper().tolist()
     clean = clean[clean["TICKERSYMBOL"].isin(tickers)]
 
     price_frames = []
