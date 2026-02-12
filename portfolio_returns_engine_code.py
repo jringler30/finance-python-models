@@ -30,38 +30,28 @@ st.set_page_config(
     layout="wide",
 )
 # ------------------------
-# Google Drive CSV loader
+# Google Drive Parquet loader
 # ------------------------
 
 import gdown
 from pathlib import Path
 import streamlit as st
+import tempfile
 
-DATA_PATH = Path(__file__).resolve().parent / "price_data.csv"
+DATA_PATH = Path(tempfile.gettempdir()) / "price_data.parquet"
 
-FILE_ID = "1l7aJ9vrCBXgheI4g0cjMCduHW9XAhpeU"
+FILE_ID = "1pMQ817V05j4RK0vqJcVkBMmOBK5zRrug"
 GDRIVE_URL = f"https://drive.google.com/uc?id={FILE_ID}"
 
-@st.cache_data
+@st.cache_data(show_spinner=True)
 def ensure_data():
     if not DATA_PATH.exists():
-        gdown.download(GDRIVE_URL, str(DATA_PATH), quiet=False)
+        out = gdown.download(GDRIVE_URL, str(DATA_PATH), quiet=False, fuzzy=True)
+        if out is None or not DATA_PATH.exists():
+            st.error("Google Drive download failed (permissions/quota/bad link).")
+            st.stop()
 
 ensure_data()
-
-st.write("price_data.csv exists:", DATA_PATH.exists())
-#_______________
-
-from pathlib import Path
-import streamlit as st
-
-p = Path(__file__).resolve().parent / "price_data.csv"
-st.write("price_data.csv exists:", p.exists())
-if p.exists():
-    first_line = p.open("r", encoding="utf-8", errors="ignore").readline().strip()
-    st.write("First line of price_data.csv:", first_line[:120])
-
-
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  CORE ENGINE FUNCTIONS (unchanged logic from original)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -404,25 +394,13 @@ def build_daily_rebalanced_series(df, holdings, initial_capital, price_field="PR
 #  LOAD DATA
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-@st.cache_data
+@st.cache_data(show_spinner=True)
 def load_data():
-    """Load price dataset from CSV in the repo."""
-    import os
-    # Resolve path relative to this script's location (works on Streamlit Cloud)
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    csv_path = os.path.join(script_dir, "price_data.csv")
-
-    if not os.path.exists(csv_path):
-        st.error(
-            f"**File not found:** `price_data.csv`\n\n"
-            f"Looked in: `{script_dir}`\n\n"
-            f"Make sure `price_data.csv` is committed to your GitHub repo "
-            f"in the same folder as this script."
-        )
+    # ensure_data() already downloads the file if missing
+    if not DATA_PATH.exists():
+        st.error(f"Dataset not found after download attempt: {DATA_PATH}")
         st.stop()
-
-    return pd.read_csv(DATA_PATH)
-
+    return pd.read_parquet(DATA_PATH)
 
 df = load_data()
 available_tickers = sorted(df["TICKERSYMBOL"].astype(str).str.strip().str.upper().unique())
