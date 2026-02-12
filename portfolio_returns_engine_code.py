@@ -217,11 +217,12 @@ def build_daily_series(df, holdings, initial_capital, price_field="PRICECLOSE"):
     all_start = pd.to_datetime(holdings["Start Date"]).min()
     all_end = pd.to_datetime(holdings["End Date"]).max()
     clean = clean[(clean["PRICEDATE"] >= all_start) & (clean["PRICEDATE"] <= all_end)]
-    
+
+    tickers = holdings["Ticker"].tolist()
     clean = clean[clean["TICKERSYMBOL"].isin(tickers)]
 
-
     frames = []
+
     for _, row in holdings.iterrows():
         tk = row["Ticker"]
         shares = row["Shares"]
@@ -239,7 +240,6 @@ def build_daily_series(df, holdings, initial_capital, price_field="PRICECLOSE"):
         daily = daily.join(f, how="outer")
     daily = daily.sort_index().ffill().bfill()
 
-    tickers = holdings["Ticker"].tolist()
     daily["Portfolio Value"] = daily[tickers].sum(axis=1)
     daily["Cost Basis"] = initial_capital
 
@@ -276,7 +276,6 @@ def build_daily_rebalanced_series(df, holdings, initial_capital, price_field="PR
     clean["TICKERSYMBOL"] = clean["TICKERSYMBOL"].astype(str).str.strip().str.upper()
     clean[price_field] = pd.to_numeric(clean[price_field], errors="coerce")
 
-    tickers = holdings["Ticker"].tolist()
     target_weights = {row["Ticker"]: row["Weight"] for _, row in holdings.iterrows()}
 
     # Build a date × ticker price matrix
@@ -285,7 +284,6 @@ def build_daily_rebalanced_series(df, holdings, initial_capital, price_field="PR
     clean = clean[(clean["PRICEDATE"] >= all_start) & (clean["PRICEDATE"] <= all_end)]
 
     clean = clean[clean["TICKERSYMBOL"].isin(tickers)]
-
 
     price_frames = []
     for tk in tickers:
