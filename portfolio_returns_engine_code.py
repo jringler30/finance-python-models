@@ -4,14 +4,17 @@ Portfolio Returns Calculation Engine — Streamlit App
 ====================================================
 Run:  streamlit run portfolio_returns_engine_code.py
 
-Dependencies: streamlit, pandas, numpy  (all pre-installed in Streamlit Cloud)
-No matplotlib, no plotly required.
+Dependencies: streamlit, pandas, numpy, gdown  (all pre-installed in Streamlit Cloud)
+No matplotlib, no plotly required (uses native Streamlit charts).
 
 CHANGELOG:
-  - Added daily rebalancing strategy (build_daily_rebalanced_series)
-  - Added buy-and-hold comparison portfolio tracking
-  - Added rebalance counter & capital gains tracking
-  - Added new Streamlit dashboard sections for rebalanced vs buy-and-hold
+  - Original: buy-and-hold engine with daily series
+  - V2: Added daily rebalancing strategy
+  - V3 (CURRENT):
+      • Unified rebalancing engine: Daily / Weekly / Monthly / Quarterly
+      • Multi-strategy comparison dashboard (all frequencies + buy-and-hold)
+      • Performance metrics table: Total Return, CAGR, Vol, Sharpe, Max DD, Turnover
+      • Memory-optimized: single pivot, filtered early, vectorized math
 """
 
 import streamlit as st
@@ -29,20 +32,17 @@ st.set_page_config(
     page_icon="📊",
     layout="wide",
 )
+
 # ------------------------
 # Google Drive Parquet loader
 # ------------------------
-
 import gdown
-from pathlib import Path
-import streamlit as st
-import tempfile
 from pathlib import Path
 
 DATA_PATH = Path("/tmp/price_data.parquet")
-
 FILE_ID = "1pMQ817V05j4RK0vqJcVkBMmOBK5zRrug"
 GDRIVE_URL = f"https://drive.google.com/uc?id={FILE_ID}"
+
 
 @st.cache_data(show_spinner=True)
 def ensure_data():
@@ -52,10 +52,13 @@ def ensure_data():
             st.error("Google Drive download failed (permissions/quota/bad link).")
             st.stop()
 
+
 ensure_data()
+
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  CORE ENGINE FUNCTIONS (unchanged logic from original)
+#  CORE ENGINE FUNCTIONS
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
 
 def validate_weights(tickers: List[str], weights: List[float],
                      tolerance: float = 0.05) -> Tuple[List[str], List[float]]:
@@ -209,6 +212,7 @@ def calculate_portfolio_returns(
 
 
 def build_daily_series(df, holdings, initial_capital, price_field="PRICECLOSE"):
+    """Buy-and-hold daily series (original logic, unchanged)."""
     clean = df.copy()
     clean["PRICEDATE"] = pd.to_datetime(clean["PRICEDATE"], errors="coerce")
     clean["TICKERSYMBOL"] = clean["TICKERSYMBOL"].astype(str).str.strip().str.upper()
@@ -222,7 +226,6 @@ def build_daily_series(df, holdings, initial_capital, price_field="PRICECLOSE"):
     clean = clean[clean["TICKERSYMBOL"].isin(tickers)]
 
     frames = []
-
     for _, row in holdings.iterrows():
         tk = row["Ticker"]
         shares = row["Shares"]
@@ -243,7 +246,6 @@ def build_daily_series(df, holdings, initial_capital, price_field="PRICECLOSE"):
     daily["Portfolio Value"] = daily[tickers].sum(axis=1)
     daily["Cost Basis"] = initial_capital
 
-    # Per-ticker cumulative returns
     for tk in tickers:
         start_val = daily[tk].iloc[0]
         daily[f"{tk} Return (%)"] = (daily[tk] / start_val - 1) * 100
@@ -251,148 +253,234 @@ def build_daily_series(df, holdings, initial_capital, price_field="PRICECLOSE"):
     return daily
 
 
-# --- NEW FUNCTION ADDED: Daily Rebalancing Engine ---
-def build_daily_rebalanced_series(df, holdings, initial_capital, price_field="PRICECLOSE"):
-    """
-    Build a daily portfolio series where holdings are rebalanced to target
-    weights at the close of every trading day.
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# V3 CHANGE: Unified multi-frequency rebalancing engine
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-    How it works (plain English):
-    1. On Day 0, buy shares according to target weights.
-    2. On each subsequent day:
-       a. Price each holding at closing price → compute total portfolio value.
-       b. Compute each asset's current weight (value / total value).
-       c. If weights differ from targets, compute dollar difference per asset.
-       d. Adjust shares: new_shares = target_weight * total_value / price.
-       e. Record the buy/sell dollar amount as a "trade" (for capital gains).
-    3. Track cumulative realized gains from all rebalancing trades.
+def build_prices_wide(df, tickers, start_date, end_date, price_field="PRICECLOSE"):
+    """
+    Build a (date × ticker) wide price matrix from the cleaned long DataFrame.
+    Filters to only the needed tickers and date range FIRST for memory safety.
+    Returns a DataFrame with DatetimeIndex and one column per ticker.
+    """
+    mask = (
+        df["TICKERSYMBOL"].isin(tickers)
+        & (df["PRICEDATE"] >= pd.Timestamp(start_date))
+        & (df["PRICEDATE"] <= pd.Timestamp(end_date))
+    )
+    subset = df.loc[mask, ["TICKERSYMBOL", "PRICEDATE", price_field]].copy()
+    subset = subset.drop_duplicates(subset=["TICKERSYMBOL", "PRICEDATE"])
+
+    wide = subset.pivot(index="PRICEDATE", columns="TICKERSYMBOL", values=price_field)
+    wide = wide.sort_index().ffill().bfill()
+
+    # Ensure all requested tickers are present
+    missing_cols = [t for t in tickers if t not in wide.columns]
+    if missing_cols:
+        raise ValueError(f"Tickers missing from price data after filtering: {missing_cols}")
+
+    # Keep only requested tickers in requested order
+    wide = wide[tickers]
+    return wide
+
+
+def _get_rebalance_dates(trading_dates, freq):
+    """
+    Given a sorted array of trading dates and a frequency string,
+    return the SET of dates on which rebalancing should occur.
+
+    freq options:
+      "Daily"     → every trading day (skip day 0)
+      "Weekly"    → first trading day of each ISO week
+      "Monthly"   → first trading day of each calendar month
+      "Quarterly" → first trading day of each quarter (Jan/Apr/Jul/Oct)
+    """
+    dates = pd.DatetimeIndex(trading_dates)
+    if len(dates) < 2:
+        return set()
+
+    if freq == "Daily":
+        # Rebalance every day except day 0
+        return set(dates[1:])
+
+    rebal_set = set()
+
+    if freq == "Weekly":
+        prev_week = dates[0].isocalendar()[1]
+        prev_year = dates[0].year
+        for dt in dates[1:]:
+            iso = dt.isocalendar()
+            if iso[1] != prev_week or dt.year != prev_year:
+                rebal_set.add(dt)
+                prev_week = iso[1]
+                prev_year = dt.year
+
+    elif freq == "Monthly":
+        prev_month = dates[0].month
+        prev_year = dates[0].year
+        for dt in dates[1:]:
+            if dt.month != prev_month or dt.year != prev_year:
+                rebal_set.add(dt)
+                prev_month = dt.month
+                prev_year = dt.year
+
+    elif freq == "Quarterly":
+        quarter_months = {1, 4, 7, 10}
+        prev_month = dates[0].month
+        prev_year = dates[0].year
+        for dt in dates[1:]:
+            if dt.month in quarter_months and (dt.month != prev_month or dt.year != prev_year):
+                rebal_set.add(dt)
+            if dt.month != prev_month or dt.year != prev_year:
+                prev_month = dt.month
+                prev_year = dt.year
+
+    else:
+        raise ValueError(f"Unknown rebalance frequency: {freq}")
+
+    return rebal_set
+
+
+def build_rebalanced_series(prices_wide, target_weights, initial_capital, rebalance_freq):
+    """
+    Unified rebalancing engine.
+
+    Parameters:
+        prices_wide    : DataFrame (date × ticker) of prices — already filtered & pivoted
+        target_weights : dict {ticker: weight} summing to 1.0
+        initial_capital: float
+        rebalance_freq : str in {"Daily", "Weekly", "Monthly", "Quarterly"}
 
     Returns:
-        rebal_daily  : pd.DataFrame — daily portfolio value & per-ticker values
-        rebal_stats  : dict — rebalance count, cumulative realized gains, final value
+        rebal_daily : DataFrame with "Portfolio Value" column + per-ticker value columns
+        rebal_stats : dict with rebalance_count, turnover, final_value, total_return
     """
-    clean = df.copy()
-    clean["PRICEDATE"] = pd.to_datetime(clean["PRICEDATE"], errors="coerce")
-    clean["TICKERSYMBOL"] = clean["TICKERSYMBOL"].astype(str).str.strip().str.upper()
-    clean[price_field] = pd.to_numeric(clean[price_field], errors="coerce")
-
-    target_weights = {row["Ticker"]: row["Weight"] for _, row in holdings.iterrows()}
-
-    # Build a date × ticker price matrix
-    all_start = pd.to_datetime(holdings["Start Date"]).min()
-    all_end = pd.to_datetime(holdings["End Date"]).max()
-    clean = clean[(clean["PRICEDATE"] >= all_start) & (clean["PRICEDATE"] <= all_end)]
-
-    tickers = holdings["Ticker"].astype(str).str.strip().str.upper().tolist()
-    clean = clean[clean["TICKERSYMBOL"].isin(tickers)]
-
-    price_frames = []
-    for tk in tickers:
-        tk_prices = (
-            clean[clean["TICKERSYMBOL"] == tk][["PRICEDATE", price_field]]
-            .drop_duplicates(subset="PRICEDATE")
-            .set_index("PRICEDATE").sort_index()
-            .rename(columns={price_field: tk})
-        )
-        price_frames.append(tk_prices)
-
-    prices = price_frames[0]
-    for f in price_frames[1:]:
-        prices = prices.join(f, how="outer")
-    prices = prices.sort_index().ffill().bfill()
-
-    # --- Day-by-day simulation ---
-    dates = prices.index.tolist()
+    tickers = list(target_weights.keys())
+    dates = prices_wide.index.tolist()
     n_days = len(dates)
 
-    # Initialize: buy shares at Day 0 prices according to target weights
+    if n_days == 0:
+        raise ValueError("No trading dates in the filtered price data.")
+
+    # Determine which dates are rebalance dates
+    rebal_dates = _get_rebalance_dates(dates, rebalance_freq)
+
+    # Initialize shares at Day 0
     shares = {}
     for tk in tickers:
         alloc = initial_capital * target_weights[tk]
-        shares[tk] = alloc / prices.loc[dates[0], tk]  # fractional shares OK
+        shares[tk] = alloc / prices_wide.loc[dates[0], tk]
 
-    # Storage for daily tracking
-    daily_portfolio_value = []        # total portfolio value each day
-    daily_ticker_values = {tk: [] for tk in tickers}  # per-ticker market value
-    rebalance_count = 0               # how many days we actually rebalanced
-    cumulative_realized_gains = 0.0   # running total of realized gains from trades
+    # Pre-allocate arrays for speed
+    portfolio_values = np.empty(n_days, dtype=np.float64)
+    ticker_values_arr = {tk: np.empty(n_days, dtype=np.float64) for tk in tickers}
+
+    rebalance_count = 0
+    total_turnover_dollars = 0.0  # sum of |trade_value| across all rebalances
 
     for i, dt in enumerate(dates):
-        # Step 1: Value the portfolio at today's close
-        ticker_values = {}
+        # Value the portfolio
+        total_value = 0.0
+        tv = {}
         for tk in tickers:
-            ticker_values[tk] = shares[tk] * prices.loc[dt, tk]
+            val = shares[tk] * prices_wide.loc[dt, tk]
+            tv[tk] = val
+            total_value += val
 
-        total_value = sum(ticker_values.values())
-        daily_portfolio_value.append(total_value)
+        portfolio_values[i] = total_value
         for tk in tickers:
-            daily_ticker_values[tk].append(ticker_values[tk])
+            ticker_values_arr[tk][i] = tv[tk]
 
-        # Step 2: Rebalance at close (skip Day 0 — already at target)
-        if i > 0:
-            # Check if any weight drifted from target
+        # Rebalance if this date is in the schedule
+        if dt in rebal_dates and total_value > 0:
+            day_turnover = 0.0
             needs_rebalance = False
             for tk in tickers:
-                current_weight = ticker_values[tk] / total_value if total_value > 0 else 0
+                current_weight = tv[tk] / total_value
                 if abs(current_weight - target_weights[tk]) > 1e-10:
                     needs_rebalance = True
                     break
 
             if needs_rebalance:
                 rebalance_count += 1
-
                 for tk in tickers:
-                    # Target number of shares after rebalancing
                     target_value = target_weights[tk] * total_value
-                    new_shares = target_value / prices.loc[dt, tk]
-
-                    # Realized gain = (sell price - avg cost) * shares sold
-                    # Simplified: we track the dollar difference as realized gain/loss
-                    # Trade amount: positive = bought more, negative = sold
+                    new_shares = target_value / prices_wide.loc[dt, tk]
                     trade_shares = new_shares - shares[tk]
-                    trade_dollars = trade_shares * prices.loc[dt, tk]
-
-                    # If we sold shares (trade_shares < 0), we realize gains/losses.
-                    # Gain = proceeds - cost_basis_of_sold_shares
-                    # For simplicity (and interpretability), we approximate:
-                    #   cost per share ≈ previous portfolio allocation / old shares
-                    if trade_shares < 0 and shares[tk] > 0:
-                        # Cost basis per share for this ticker (before rebalance)
-                        cost_per_share = ticker_values[tk] / shares[tk]  # = current price
-                        # At daily rebalance with same-day close, realized gain ≈ 0
-                        # because cost_per_share equals current price.
-                        # True realized gains accumulate from the *sequence* of trades.
-                        # We track cumulative turnover-weighted P&L instead:
-                        proceeds = abs(trade_shares) * prices.loc[dt, tk]
-                        cost_basis_sold = abs(trade_shares) * cost_per_share
-                        cumulative_realized_gains += (proceeds - cost_basis_sold)
-
+                    trade_dollars = abs(trade_shares * prices_wide.loc[dt, tk])
+                    day_turnover += trade_dollars
                     shares[tk] = new_shares
+
+                total_turnover_dollars += day_turnover
+
+    # Turnover proxy: total |trade$| / average portfolio value
+    avg_port_value = np.mean(portfolio_values)
+    turnover_proxy = (total_turnover_dollars / avg_port_value) if avg_port_value > 0 else 0.0
 
     # Build output DataFrame
     rebal_daily = pd.DataFrame(index=dates)
     rebal_daily.index.name = "PRICEDATE"
     for tk in tickers:
-        rebal_daily[f"{tk} (Rebal)"] = daily_ticker_values[tk]
-    rebal_daily["Rebalanced Portfolio Value"] = daily_portfolio_value
-
-    # Per-ticker cumulative return for rebalanced portfolio
-    for tk in tickers:
-        start_val = rebal_daily[f"{tk} (Rebal)"].iloc[0]
-        if start_val > 0:
-            rebal_daily[f"{tk} Rebal Return (%)"] = (
-                rebal_daily[f"{tk} (Rebal)"] / start_val - 1
-            ) * 100
+        rebal_daily[f"{tk} (Rebal)"] = ticker_values_arr[tk]
+    rebal_daily["Portfolio Value"] = portfolio_values
 
     rebal_stats = {
         "rebalance_count": rebalance_count,
-        "cumulative_realized_gains": round(cumulative_realized_gains, 2),
-        "rebal_final_value": round(daily_portfolio_value[-1], 2),
-        "rebal_total_return": round(daily_portfolio_value[-1] / initial_capital - 1, 6),
+        "turnover_proxy": round(turnover_proxy, 4),
+        "final_value": round(portfolio_values[-1], 2),
+        "total_return": round(portfolio_values[-1] / initial_capital - 1, 6),
     }
 
     return rebal_daily, rebal_stats
-# --- END NEW FUNCTION ---
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# V3 CHANGE: Performance metrics calculator
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def compute_strategy_metrics(daily_values: np.ndarray, initial_capital: float) -> dict:
+    """
+    Compute standard performance metrics from a daily portfolio value series.
+
+    Returns dict with:
+      total_return, cagr, annualized_vol, sharpe, max_drawdown
+    """
+    n = len(daily_values)
+    if n < 2:
+        return {
+            "total_return": 0.0, "cagr": 0.0, "annualized_vol": 0.0,
+            "sharpe": 0.0, "max_drawdown": 0.0,
+        }
+
+    final = daily_values[-1]
+    total_return = final / initial_capital - 1
+
+    # CAGR using 252 trading days/year
+    years = n / 252.0
+    if years > 0 and final > 0 and initial_capital > 0:
+        cagr = (final / initial_capital) ** (1 / years) - 1
+    else:
+        cagr = 0.0
+
+    # Daily returns
+    daily_rets = np.diff(daily_values) / daily_values[:-1]
+    ann_vol = np.std(daily_rets, ddof=1) * np.sqrt(252) if len(daily_rets) > 1 else 0.0
+
+    # Sharpe (Rf = 0)
+    sharpe = (cagr / ann_vol) if ann_vol > 0 else 0.0
+
+    # Max drawdown
+    running_max = np.maximum.accumulate(daily_values)
+    drawdowns = (daily_values - running_max) / running_max
+    max_dd = float(np.min(drawdowns))
+
+    return {
+        "total_return": round(total_return, 6),
+        "cagr": round(cagr, 6),
+        "annualized_vol": round(ann_vol, 6),
+        "sharpe": round(sharpe, 4),
+        "max_drawdown": round(max_dd, 6),
+    }
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -401,28 +489,27 @@ def build_daily_rebalanced_series(df, holdings, initial_capital, price_field="PR
 
 _REQUIRED_COLS = ["TICKERSYMBOL", "PRICEDATE", "PRICECLOSE", "PRICEMID", "TRADINGITEMSTATUSID"]
 
+
 @st.cache_data(show_spinner=True)
 def load_data():
     ensure_data()
 
-    # Guardrail: file exists + not tiny
     if not DATA_PATH.exists():
         st.error(f"Dataset not found: {DATA_PATH}")
         st.stop()
-    if DATA_PATH.stat().st_size < 10 * 1024 * 1024:  # 10MB
+    if DATA_PATH.stat().st_size < 10 * 1024 * 1024:
         st.error("Downloaded file looks too small (likely corrupt). Reboot app to retry.")
         st.stop()
 
-    # Read only needed columns
     try:
         df = pd.read_parquet(DATA_PATH, columns=_REQUIRED_COLS)
     except Exception as e:
         st.error(f"Failed to read parquet: {e}")
         st.stop()
 
-    # Clean once
-    df = prepare_price_data(df, price_field="PRICECLOSE")  # this also normalizes dates/tickers
+    df = prepare_price_data(df, price_field="PRICECLOSE")
     return df
+
 
 df = load_data()
 available_tickers = sorted(df["TICKERSYMBOL"].astype(str).str.strip().str.upper().unique())
@@ -444,7 +531,6 @@ num_holdings = st.sidebar.number_input(
 ticker_inputs = []
 weight_inputs = []
 
-# Sensible defaults for first load
 defaults = [
     ("SPY", 0.50), ("AGG", 0.30), ("QQQ", 0.20),
     ("AAPL", 0.00), ("BND", 0.00),
@@ -454,7 +540,6 @@ for i in range(int(num_holdings)):
     cols = st.sidebar.columns([2, 1])
     default_tk = defaults[i][0] if i < len(defaults) else ""
     default_wt = defaults[i][1] if i < len(defaults) else 0.0
-    # Safe index: fall back to first available ticker if default isn't in dataset
     default_idx = available_tickers.index(default_tk) if default_tk in available_tickers else 0
     tk = cols[0].selectbox(
         f"Ticker {i+1}", options=available_tickers,
@@ -477,7 +562,6 @@ df_dates = pd.to_datetime(df["PRICEDATE"], errors="coerce").dropna()
 min_date = df_dates.min().date()
 max_date = df_dates.max().date()
 
-# Safe defaults: 1 year before max_date → max_date (clamped to actual range)
 default_end = max_date
 default_start = max(min_date, (max_date - timedelta(days=365)))
 
@@ -492,12 +576,29 @@ initial_capital = st.sidebar.number_input(
 price_field = st.sidebar.selectbox("Price Field", ["PRICECLOSE", "PRICEMID"])
 allow_cash = st.sidebar.checkbox("Whole shares only (cash residual)", value=False)
 
-# --- NEW SIDEBAR OPTION ADDED ---
-enable_rebalancing = st.sidebar.checkbox("Enable Daily Rebalancing Comparison", value=True)
-# --- END NEW SIDEBAR OPTION ---
+# --- V3 CHANGE: Rebalancing controls ---
+st.sidebar.markdown("---")
+st.sidebar.markdown("### Rebalancing")
+
+enable_rebalancing = st.sidebar.checkbox("Enable Rebalancing Comparison", value=True)
+
+REBAL_FREQS = ["Daily", "Weekly", "Monthly", "Quarterly"]
+selected_freq = st.sidebar.selectbox(
+    "Rebalance Frequency",
+    options=REBAL_FREQS,
+    index=2,  # default Monthly
+    disabled=not enable_rebalancing,
+)
+
+show_all_strategies = st.sidebar.checkbox(
+    "Show all strategies (slower)",
+    value=False,
+    disabled=not enable_rebalancing,
+    help="Compute & compare Buy-and-Hold + all 4 rebalance frequencies at once.",
+)
+# --- END V3 SIDEBAR CHANGES ---
 
 run_btn = st.sidebar.button("🚀 Calculate Returns", use_container_width=True, type="primary")
-
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  MAIN PAGE
@@ -538,7 +639,7 @@ if summary["tickers_dropped"] > 0:
         st.warning(f"⚠️ Dropped **{tk}** (weight {w:.2%}): {reason}")
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  KPI CARDS
+#  KPI CARDS (Buy-and-Hold)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 total_return = summary["portfolio_total_return"]
@@ -555,26 +656,17 @@ col4.metric("Unrealized Gain", f"${gain_dollars:+,.0f}",
 st.markdown("---")
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  CHARTS
+#  CHARTS (Buy-and-Hold)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 daily = build_daily_series(df, holdings, float(initial_capital), price_field)
 tickers_used = holdings["Ticker"].tolist()
 
-# ── Chart 1: Portfolio Value vs Cost Basis (shaded gain/loss) ──
+# ── Chart 1: Portfolio Value vs Cost Basis ──
 st.subheader("Portfolio Value vs Cost Basis")
 st.caption("Green shading = unrealized gain · Red shading = unrealized loss")
 
 chart1_df = daily[["Portfolio Value", "Cost Basis"]].copy()
-chart1_df["Gain"] = np.where(
-    chart1_df["Portfolio Value"] >= chart1_df["Cost Basis"],
-    chart1_df["Portfolio Value"], np.nan
-)
-chart1_df["Loss"] = np.where(
-    chart1_df["Portfolio Value"] < chart1_df["Cost Basis"],
-    chart1_df["Portfolio Value"], np.nan
-)
-
 st.line_chart(
     chart1_df[["Portfolio Value", "Cost Basis"]],
     color=["#1a73e8", "#888888"],
@@ -582,7 +674,6 @@ st.line_chart(
     height=420,
 )
 
-# Supplemental: area chart showing gain/loss magnitude
 gain_area = daily[["Portfolio Value", "Cost Basis"]].copy()
 gain_area["Unrealized Gain/Loss ($)"] = gain_area["Portfolio Value"] - gain_area["Cost Basis"]
 st.area_chart(
@@ -604,106 +695,210 @@ st.line_chart(
 st.markdown("---")
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# --- NEW SECTION: Daily Rebalancing vs Buy-and-Hold Comparison ---
+# V3 CHANGE: Multi-Frequency Rebalancing Comparison Section
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 if enable_rebalancing:
-    st.subheader("🔄 Daily Rebalancing vs Buy-and-Hold")
-    st.caption(
-        "Compares a daily-rebalanced portfolio (returns to target weights every close) "
-        "against the original buy-and-hold portfolio."
-    )
+    st.subheader("🔄 Rebalancing Strategy Comparison")
 
-    # Run the rebalancing simulation
-    rebal_daily, rebal_stats = build_daily_rebalanced_series(
-        df, holdings, float(initial_capital), price_field
-    )
+    # Build target weights dict from holdings
+    target_weights = {row["Ticker"]: row["Weight"] for _, row in holdings.iterrows()}
 
-    # --- KPI cards for rebalancing comparison ---
-    bh_final = summary["portfolio_end_value"]
-    rb_final = rebal_stats["rebal_final_value"]
-    rb_return = rebal_stats["rebal_total_return"]
-    bh_return = summary["portfolio_total_return"]
+    # Build wide price matrix ONCE (memory-efficient: filtered by tickers + dates)
+    try:
+        all_start = pd.to_datetime(holdings["Start Date"]).min()
+        all_end = pd.to_datetime(holdings["End Date"]).max()
+        prices_wide = build_prices_wide(df, tickers_used, all_start, all_end, price_field)
+    except ValueError as e:
+        st.error(f"**Error building price matrix:** {e}")
+        st.stop()
 
-    rc1, rc2, rc3, rc4 = st.columns(4)
-    rc1.metric(
-        "Rebalanced Final Value",
-        f"${rb_final:,.0f}",
-        delta=f"{rb_return:+.2%}",
-    )
-    rc2.metric(
-        "Buy-and-Hold Final Value",
-        f"${bh_final:,.0f}",
-        delta=f"{bh_return:+.2%}",
-    )
-    rc3.metric(
-        "Rebalancing Advantage",
-        f"${rb_final - bh_final:+,.0f}",
-        delta=f"{(rb_return - bh_return):+.4%}",
-    )
-    rc4.metric(
-        "Rebalance Events",
-        f"{rebal_stats['rebalance_count']:,}",
-        delta=f"Realized G/L: ${rebal_stats['cumulative_realized_gains']:+,.2f}",
-    )
+    # Determine which strategies to compute
+    if show_all_strategies:
+        freqs_to_run = REBAL_FREQS  # Daily, Weekly, Monthly, Quarterly
+        st.caption("Computing all strategies: Buy & Hold + Daily / Weekly / Monthly / Quarterly rebalancing…")
+    else:
+        freqs_to_run = [selected_freq]
+        st.caption(f"Comparing Buy & Hold vs **{selected_freq}** rebalancing.")
 
-    # --- Chart: Rebalanced vs Buy-and-Hold portfolio value over time ---
-    comparison_df = pd.DataFrame(index=rebal_daily.index)
-    comparison_df["Rebalanced"] = rebal_daily["Rebalanced Portfolio Value"]
-    comparison_df["Buy-and-Hold"] = daily["Portfolio Value"]
+    # Run rebalancing for each frequency
+    strategy_results = {}  # freq -> (rebal_daily, rebal_stats)
+    for freq in freqs_to_run:
+        try:
+            rd, rs = build_rebalanced_series(prices_wide, target_weights, float(initial_capital), freq)
+            strategy_results[freq] = (rd, rs)
+        except ValueError as e:
+            st.warning(f"⚠️ Could not compute {freq} rebalancing: {e}")
 
-    # Align indices (both should match, but just in case)
-    comparison_df = comparison_df.dropna()
+    if not strategy_results:
+        st.error("No rebalancing strategies could be computed.")
+    else:
+        # ── Build comparison DataFrame for chart ──
+        comparison_df = pd.DataFrame(index=prices_wide.index)
+        comparison_df.index.name = "PRICEDATE"
 
-    st.line_chart(
-        comparison_df,
-        color=["#e8710a", "#1a73e8"],
-        use_container_width=True,
-        height=400,
-    )
+        # Buy-and-hold series (from daily)
+        bh_values = daily["Portfolio Value"].reindex(comparison_df.index)
+        comparison_df["Buy & Hold"] = bh_values
 
-    # --- Chart: Cumulative difference (Rebalanced - Buy&Hold) ---
-    comparison_df["Rebal vs B&H ($)"] = (
-        comparison_df["Rebalanced"] - comparison_df["Buy-and-Hold"]
-    )
-    advantage_color = "#34a853" if comparison_df["Rebal vs B&H ($)"].iloc[-1] >= 0 else "#ea4335"
-    st.area_chart(
-        comparison_df[["Rebal vs B&H ($)"]],
-        color=[advantage_color],
-        use_container_width=True,
-        height=200,
-    )
+        for freq, (rd, rs) in strategy_results.items():
+            comparison_df[f"Rebal: {freq}"] = rd["Portfolio Value"].reindex(comparison_df.index)
 
-    # --- Rebalancing methodology note ---
-    with st.expander("ℹ️ Rebalancing Methodology"):
-        st.markdown("""
-**Daily Rebalancing Logic:**
-- At each trading day close, the portfolio is valued using closing prices.
+        comparison_df = comparison_df.dropna()
+
+        # ── Metrics table ──
+        bh_vals_arr = comparison_df["Buy & Hold"].values
+        bh_metrics = compute_strategy_metrics(bh_vals_arr, float(initial_capital))
+        bh_metrics["rebalance_count"] = 0
+        bh_metrics["turnover_proxy"] = 0.0
+
+        metrics_rows = [{
+            "Strategy": "Buy & Hold",
+            "Final Value ($)": f"${bh_vals_arr[-1]:,.0f}",
+            "Total Return (%)": f"{bh_metrics['total_return']:+.2%}",
+            "CAGR (%)": f"{bh_metrics['cagr']:+.2%}",
+            "Ann. Volatility (%)": f"{bh_metrics['annualized_vol']:.2%}",
+            "Sharpe Ratio": f"{bh_metrics['sharpe']:.3f}",
+            "Max Drawdown (%)": f"{bh_metrics['max_drawdown']:.2%}",
+            "Turnover": f"{bh_metrics['turnover_proxy']:.2f}",
+            "Rebal Events": 0,
+        }]
+
+        for freq in freqs_to_run:
+            if freq not in strategy_results:
+                continue
+            rd, rs = strategy_results[freq]
+            vals = comparison_df[f"Rebal: {freq}"].values
+            m = compute_strategy_metrics(vals, float(initial_capital))
+            metrics_rows.append({
+                "Strategy": f"Rebal: {freq}",
+                "Final Value ($)": f"${rs['final_value']:,.0f}",
+                "Total Return (%)": f"{m['total_return']:+.2%}",
+                "CAGR (%)": f"{m['cagr']:+.2%}",
+                "Ann. Volatility (%)": f"{m['annualized_vol']:.2%}",
+                "Sharpe Ratio": f"{m['sharpe']:.3f}",
+                "Max Drawdown (%)": f"{m['max_drawdown']:.2%}",
+                "Turnover": f"{rs['turnover_proxy']:.2f}",
+                "Rebal Events": rs["rebalance_count"],
+            })
+
+        st.markdown("#### Performance Metrics")
+        metrics_df = pd.DataFrame(metrics_rows)
+        st.dataframe(metrics_df, use_container_width=True, hide_index=True)
+
+        # ── KPI cards: selected strategy vs buy-and-hold ──
+        primary_freq = freqs_to_run[0]
+        if primary_freq in strategy_results:
+            _, primary_stats = strategy_results[primary_freq]
+            bh_final = bh_vals_arr[-1]
+            rb_final = primary_stats["final_value"]
+            rb_return = primary_stats["total_return"]
+            bh_ret = bh_metrics["total_return"]
+
+            rc1, rc2, rc3, rc4 = st.columns(4)
+            rc1.metric(
+                f"Rebal ({primary_freq}) Final",
+                f"${rb_final:,.0f}",
+                delta=f"{rb_return:+.2%}",
+            )
+            rc2.metric(
+                "Buy-and-Hold Final",
+                f"${bh_final:,.0f}",
+                delta=f"{bh_ret:+.2%}",
+            )
+            rc3.metric(
+                "Rebalancing Advantage",
+                f"${rb_final - bh_final:+,.0f}",
+                delta=f"{(rb_return - bh_ret):+.4%}",
+            )
+            rc4.metric(
+                "Rebalance Events",
+                f"{primary_stats['rebalance_count']:,}",
+                delta=f"Turnover: {primary_stats['turnover_proxy']:.2f}",
+            )
+
+        # ── Chart: Portfolio value over time ──
+        st.markdown("#### Portfolio Value Over Time")
+        # Assign colors: blue for B&H, then orange/green/purple/red for rebal frequencies
+        strategy_colors = ["#1a73e8"]  # B&H
+        freq_color_map = {
+            "Daily": "#e8710a",
+            "Weekly": "#34a853",
+            "Monthly": "#9c27b0",
+            "Quarterly": "#ea4335",
+        }
+        for freq in freqs_to_run:
+            if freq in strategy_results:
+                strategy_colors.append(freq_color_map.get(freq, "#666666"))
+
+        st.line_chart(
+            comparison_df,
+            color=strategy_colors,
+            use_container_width=True,
+            height=420,
+        )
+
+        # ── Toggle: Drawdown chart ──
+        show_drawdown = st.checkbox("Show Drawdown Chart", value=False)
+        if show_drawdown:
+            st.markdown("#### Drawdown Over Time")
+            dd_df = pd.DataFrame(index=comparison_df.index)
+            for col in comparison_df.columns:
+                vals = comparison_df[col].values
+                running_max = np.maximum.accumulate(vals)
+                dd_df[col] = ((vals - running_max) / running_max) * 100  # as percentage
+
+            st.area_chart(
+                dd_df,
+                color=strategy_colors,
+                use_container_width=True,
+                height=300,
+            )
+
+        # ── Difference chart: selected rebal vs B&H ──
+        if primary_freq in strategy_results:
+            diff_col = f"Rebal: {primary_freq}"
+            if diff_col in comparison_df.columns:
+                diff_series = comparison_df[diff_col] - comparison_df["Buy & Hold"]
+                diff_chart = pd.DataFrame({"Rebal vs B&H ($)": diff_series})
+                advantage_color = "#34a853" if diff_series.iloc[-1] >= 0 else "#ea4335"
+                st.area_chart(
+                    diff_chart,
+                    color=[advantage_color],
+                    use_container_width=True,
+                    height=200,
+                )
+
+        # ── Methodology expander ──
+        with st.expander("ℹ️ Rebalancing Methodology"):
+            st.markdown("""
+**Rebalancing Logic:**
+- At each scheduled rebalance date, the portfolio is valued using closing prices.
 - Each asset's current weight is compared to its target weight.
 - If any weight has drifted, shares are bought/sold to restore exact target weights.
 - Trades execute at the same-day closing price (no look-ahead bias).
 - Fractional shares are used (consistent with the base engine).
 
-**Buy-and-Hold Comparison:**
-- Uses identical starting allocations and share counts.
-- No rebalancing ever occurs — weights drift with market prices.
-- This is the original portfolio from the main calculation above.
+**Rebalance Schedules:**
+- **Daily:** Every trading day.
+- **Weekly:** First trading day of each ISO week (typically Monday).
+- **Monthly:** First trading day of each calendar month.
+- **Quarterly:** First trading day of each quarter (Jan / Apr / Jul / Oct).
 
-**Capital Gains Tracking:**
-- Realized gains/losses are recorded when shares are sold during rebalancing.
-- At daily rebalance frequency with same-close execution, per-trade realized
-  gains are near zero (selling at the price you'd re-buy at). Cumulative
-  gains reflect the net effect of the rebalancing sequence over time.
+**Metrics Definitions:**
+- **CAGR:** Compound Annual Growth Rate, using 252 trading days = 1 year.
+- **Annualized Volatility:** Std dev of daily returns × √252.
+- **Sharpe Ratio:** CAGR / Annualized Volatility (risk-free rate = 0%).
+- **Max Drawdown:** Largest peak-to-trough decline as a percentage.
+- **Turnover:** Sum of |trade dollars| / average portfolio value. Higher = more trading.
 
 **Limitations:**
 - No transaction costs or slippage modeled.
 - No tax-aware trade timing.
 - No partial rebalancing thresholds (always rebalances to exact targets).
-        """)
+            """)
 
     st.markdown("---")
-# --- END NEW SECTION ---
-
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  HOLDINGS TABLE
@@ -711,7 +906,6 @@ if enable_rebalancing:
 
 st.subheader("Per-Holding Detail")
 
-# Format for display
 display_df = holdings.copy()
 display_df["Weight"] = display_df["Weight"].apply(lambda x: f"{x:.1%}")
 display_df["Return"] = display_df["Return"].apply(lambda x: f"{x:+.2%}")
